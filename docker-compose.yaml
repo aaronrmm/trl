@@ -1,0 +1,59 @@
+version: '2.3'
+
+services:
+  rlhf_windows_gpu_build:
+    build:
+      context: ./
+      dockerfile: ./Dockerfile
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities:
+              - gpu
+
+  rlhf_development_env:
+    extends:
+      service: rlhf_windows_gpu_build
+    container_name: rlhf_development_env
+    volumes:
+      - ./raw_data:/project/raw_data:ro
+      - ./gpt-neox-20b_peft:/project/gpt-neox-20b_peft
+      - ./configs:/project/configs:ro
+      - ./outputs:/project/outputs
+      - ./data:/project/data:ro
+      - ./.cache:/project/outputs/.cache
+    environment:
+      HF_DATASETS_CACHE: /project/outputs/.cache
+      TRANSFORMERS_CACHE: /project/outputs/.cache
+      HF_HOME: /project/outputs/.cache
+
+  rlhf_env:
+    extends:
+      service: rlhf_windows_gpu_build
+    container_name: rlhf_env
+    environment:
+      HF_DATASETS_CACHE: /project/outputs/.cache
+      TRANSFORMERS_CACHE: /project/outputs/.cache
+      HF_HOME: /project/outputs/.cache
+
+  rlhf_bash:
+    extends:
+      service: rlhf_env
+    container_name: rlhf_bash
+    entrypoint: sleep infinity
+    volumes:
+      - ./raw_data:/project/raw_data:ro
+      - ./gpt-neox-20b_peft:/project/gpt-neox-20b_peft
+      - ./configs:/project/configs:ro
+      - ./outputs:/project/outputs
+      - ./data:/project/data:ro
+      - ./.cache:/project/outputs/.cache
+
+  rlhf_jupyter:
+    extends:
+      service: rlhf_env
+    container_name: rlhf_jupyter
+    entrypoint: "bash -c 'jupyter lab --no-browser --ip=0.0.0.0 --port=${notebook_port:-8819} --allow-root'"
+    ports:
+      - "${notebook_ip:-0.0.0.0}:${notebook_port:-8819}:${notebook_port:-8819}"
