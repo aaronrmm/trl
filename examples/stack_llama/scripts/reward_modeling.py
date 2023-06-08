@@ -8,21 +8,15 @@ import torch.nn as nn
 from datasets import load_dataset
 from peft import LoraConfig, TaskType, get_peft_model
 from transformers import (
-    AutoConfig,
     AutoModelForSequenceClassification,
     AutoTokenizer,
     HfArgumentParser,
     PreTrainedTokenizerBase,
     Trainer,
+    TrainerCallback,
     TrainingArguments,
 )
 from transformers.utils import PaddingStrategy
-
-
-DEFAULT_PAD_TOKEN = "[PAD]"
-DEFAULT_EOS_TOKEN = "</s>"
-DEFAULT_BOS_TOKEN = "</s>"
-DEFAULT_UNK_TOKEN = "</s>"
 
 
 # Define and parse arguments.
@@ -54,6 +48,12 @@ class ScriptArguments:
             "help": "The model that you want to train from the Hugging Face hub. E.g. gpt2, gpt2-xl, bert, etc."
         },
     )
+    tokenizer_name: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "The tokenizer for your model, if left empty will use the default for your model",
+        },
+    )
     bf16: Optional[bool] = field(
         default=True,
         metadata={
@@ -83,6 +83,11 @@ class ScriptArguments:
     lr_scheduler_type: Optional[str] = field(
         default="linear",
         metadata={"help": "The lr scheduler"},
+    )
+    max_length: Optional[int] = field(default=512)
+    eval_first_step: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Whether to run eval after the first step"},
     )
 
 
@@ -126,22 +131,10 @@ training_args = TrainingArguments(
     lr_scheduler_type=script_args.lr_scheduler_type,
 )
 # Load the value-head model and tokenizer.
-tokenizer = AutoTokenizer.from_pretrained(script_args.model_name, use_auth_token=True)
-config = AutoConfig.from_pretrained(script_args.model_name)
+tokenizer_name = script_args.tokenizer_name if script_args.tokenizer_name is not None else script_args.model_name
+tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_auth_token=True)
+tokenizer.pad_token = tokenizer.eos_token
 
-if "llama" in script_args.model_name:
-    # required for llama
-    tokenizer.add_special_tokens(
-        {
-            "eos_token": DEFAULT_EOS_TOKEN,
-            "bos_token": DEFAULT_BOS_TOKEN,
-            "unk_token": DEFAULT_UNK_TOKEN,
-            "pad_token": DEFAULT_PAD_TOKEN,
-        }
-    )
-else:
-    # required for gpt2
-    tokenizer.pad_token = tokenizer.eos_token
 
 peft_config = LoraConfig(
     task_type=TaskType.SEQ_CLS,
@@ -186,14 +179,26 @@ def preprocess_function(examples):
     return new_examples
 
 
-# preprocess the dataset and filter out QAs that are longer than 512
+# preprocess the dataset and filter out QAs that are longer than script_args.max_length
 train_dataset = train_dataset.map(
-    preprocess_function, batched=True, num_proc=num_proc, remove_columns=original_columns
+    preprocess_function,
+    batched=True,
+    num_proc=num_proc,
+    remove_columns=original_columns,
 )
-train_dataset = train_dataset.filter(lambda x: len(x["input_ids_j"]) <= 512 and len(x["input_ids_k"]) <= 512)
+train_dataset = train_dataset.filter(
+    lambda x: len(x["input_ids_j"]) <= script_args.max_length and len(x["input_ids_k"]) <= script_args.max_length
+)
 
-eval_dataset = eval_dataset.map(preprocess_function, batched=True, num_proc=num_proc, remove_columns=original_columns)
-eval_dataset = eval_dataset.filter(lambda x: len(x["input_ids_j"]) <= 512 and len(x["input_ids_k"]) <= 512)
+eval_dataset = eval_dataset.map(
+    preprocess_function,
+    batched=True,
+    num_proc=num_proc,
+    remove_columns=original_columns,
+)
+eval_dataset = eval_dataset.filter(
+    lambda x: len(x["input_ids_j"]) <= script_args.max_length and len(x["input_ids_k"]) <= script_args.max_length
+)
 
 
 # We need to define a special data collator that batches the data in our j vs k format.
@@ -276,8 +281,18 @@ trainer = RewardTrainer(
     train_dataset=train_dataset,
     eval_dataset=eval_dataset,
     compute_metrics=compute_metrics,
-    data_collator=RewardDataCollatorWithPadding(tokenizer=tokenizer, max_length=512),
+    data_collator=RewardDataCollatorWithPadding(tokenizer=tokenizer, max_length=script_args.max_length),
 )
+
+
+if script_args.eval_first_step:
+
+    class EvaluateFirstStepCallback(TrainerCallback):
+        def on_step_end(self, args, state, control, **kwargs):
+            if state.global_step == 1:
+                control.should_evaluate = True
+
+    trainer.add_callback(EvaluateFirstStepCallback())
 
 trainer.train(script_args.resume_from_checkpoint)
 
